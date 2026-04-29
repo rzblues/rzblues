@@ -1,8 +1,4 @@
-"""
-Panic 4-Factor Buy Strategy — main orchestrator.
-
-Combines scorer → filters → sizer into one call.
-"""
+"""Panic 4-Factor Buy Strategy — main orchestrator."""
 
 from dataclasses import dataclass
 from typing import List, Optional
@@ -10,6 +6,7 @@ from typing import List, Optional
 from .scorer import PanicScore, compute_panic_score
 from .filters import FilterResult, apply_filters
 from .sizer import EntryPlan, ExitPlan, compute_entry_plan, INDEX_INSTRUMENTS
+from .credit import CreditStressResult
 from .data import MarketSnapshot
 
 
@@ -40,6 +37,8 @@ class StrategyOutput:
             "",
             str(self.panic),
             "",
+            str(self.snapshot.credit),
+            "",
             str(self.filters),
             "",
             str(self.entry),
@@ -59,13 +58,6 @@ def run_strategy(
     avg_entry_price: Optional[float] = None,
     instruments: List[str] = None,
 ) -> StrategyOutput:
-    """
-    Full pipeline: snapshot → score → filter → size → output.
-
-    current_allocation_pct: fraction of strategy capital already deployed
-                            (0.0 if this is a fresh signal evaluation).
-    avg_entry_price:        provide if already in a position, to show exit levels.
-    """
     panic = compute_panic_score(
         vix=snapshot.vix,
         fear_greed=snapshot.fear_greed,
@@ -75,7 +67,7 @@ def run_strategy(
     filters = apply_filters(
         drawdown_pct=snapshot.drawdown_pct,
         price_vs_200ma=snapshot.price_vs_200ma,
-        credit_crisis=snapshot.credit_crisis,
+        credit_crisis=snapshot.credit.is_crisis,   # auto-computed
     )
     entry = compute_entry_plan(
         panic=panic,

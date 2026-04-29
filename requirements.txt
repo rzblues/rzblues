@@ -1,1 +1,8 @@
 yfinance>=0.2.40
+requests>=2.31
+pandas>=2.0
+openpyxl>=3.1
+xlrd>=2.0
+lxml>=4.9
+# Optional: set FRED_API_KEY env var and install fredapi for direct HY OAS data
+# fredapi>=0.5
