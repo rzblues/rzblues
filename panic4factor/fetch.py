@@ -202,12 +202,34 @@ def _find_col(df: pd.DataFrame, candidates: list[str]) -> str:
 
 # ── NAAIM Exposure Index ──────────────────────────────────────────────────────
 
-# They update the Excel file on their server; URL has been stable but may shift.
-_NAAIM_URLS = [
+# Stale fallback URLs — only used if dynamic discovery fails.
+_NAAIM_FALLBACK_URLS = [
     "https://www.naaim.org/wp-content/uploads/NAAIM-Data-for-Download.xlsx",
-    "https://www.naaim.org/wp-content/uploads/2024/10/NAAIM-Data-for-Download.xlsx",
-    "https://www.naaim.org/wp-content/uploads/2024/01/NAAIM-Data-for-Download.xlsx",
+    "https://naaim.org/wp-content/uploads/NAAIM-Data-for-Download.xlsx",
 ]
+_NAAIM_INDEX_PAGE = "https://www.naaim.org/programs/naaim-exposure-index/"
+
+
+def _find_naaim_excel_url() -> Optional[str]:
+    """
+    Scrape the NAAIM exposure index page to discover the current Excel URL.
+    NAAIM updates the filename weekly (e.g. USE_Data-since-Inception_2026-05-06.xlsx),
+    so hardcoded URLs go stale quickly — dynamic discovery is the reliable path.
+    """
+    import re
+    try:
+        resp = requests.get(_NAAIM_INDEX_PAGE, headers=_HEADERS, timeout=20)
+        resp.raise_for_status()
+        # Match any .xlsx link in the page HTML
+        hits = re.findall(r'https?://[^\s"\'<>]*\.xlsx', resp.text)
+        # Prefer files that look like NAAIM data exports
+        keywords = ("inception", "naaim", "data", "exposure", "use_data")
+        for url in hits:
+            if any(kw in url.lower() for kw in keywords):
+                return url
+        return hits[0] if hits else None
+    except Exception:
+        return None
 
 
 def fetch_naaim_exposure() -> float:
@@ -229,7 +251,14 @@ def fetch_naaim_exposure() -> float:
 
 
 def _try_naaim_excel() -> Optional[bytes]:
-    for url in _NAAIM_URLS:
+    # Build priority list: dynamic discovery first, then stale fallbacks
+    urls: list[str] = []
+    discovered = _find_naaim_excel_url()
+    if discovered:
+        urls.append(discovered)
+    urls.extend(_NAAIM_FALLBACK_URLS)
+
+    for url in urls:
         try:
             resp = requests.get(url, headers=_HEADERS, timeout=20)
             if resp.status_code == 200 and len(resp.content) > 1000:

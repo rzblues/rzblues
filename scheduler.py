@@ -64,12 +64,15 @@ def run_check(ticker: str, state: TradingState, send: bool) -> TradingState:
     new_alloc = output.entry.effective_target_pct
     add_now   = output.entry.add_now_pct
 
-    # ── Entry alert: tier upgraded ────────────────────────────────────────────
+    # ── Entry alert: add_now > 0  (tier upgrade OR filter relaxation) ───────────
     old_rank = _TIER_ORDER.get(state.last_tier, 0)
     new_rank = _TIER_ORDER.get(new_tier, 0)
 
-    if new_rank > old_rank and add_now > 0:
-        print(f"\n  *** ENTRY SIGNAL — tier {state.last_tier} → {new_tier} ***")
+    if add_now > 0:
+        reason = (f"tier {state.last_tier} → {new_tier}"
+                  if new_rank != old_rank else
+                  f"filter relaxed, same tier {new_tier}")
+        print(f"\n  *** ENTRY SIGNAL — {reason} ***")
         state.update_entry(snap.index_price, new_alloc)
         state.last_tier = new_tier
 
@@ -81,14 +84,15 @@ def run_check(ticker: str, state: TradingState, send: bool) -> TradingState:
             print("  Alert sent.")
 
     elif new_rank < old_rank and state.in_position:
-        # Tier degraded but we're still holding — update last_tier without closing
+        # Tier degraded but still holding — track the drop
         print(f"\n  Score dropped ({state.last_tier} → {new_tier}). Holding position.")
         state.last_tier = new_tier
 
     elif not state.in_position and new_rank == 0:
         state.last_tier = "NO_SIGNAL"
 
-    # ── Exit alerts: check tranches ───────────────────────────────────────────
+    # ── Exit alerts: capture avg_entry BEFORE check_exits() can call close() ──
+    entry_price_snapshot = state.avg_entry_price
     if state.in_position:
         fired = state.check_exits(
             price=snap.index_price,
@@ -101,7 +105,7 @@ def run_check(ticker: str, state: TradingState, send: bool) -> TradingState:
             if send:
                 alerts.send_alert(
                     f"EXIT {ticker}  Tranche {tranche_n}/3",
-                    alerts.fmt_exit(tranche_n, reason, snap, state.avg_entry_price),
+                    alerts.fmt_exit(tranche_n, reason, snap, entry_price_snapshot),
                 )
                 print("  Alert sent.")
 

@@ -61,16 +61,25 @@ class Trade:
     entry_date: date
     entry_price: float
     entry_tier: str
+    entry_allocation: float = 0.0    # peak allocation fraction during this trade
     exit_date: Optional[date] = None
     exit_price: Optional[float] = None
     max_drawdown_pct: float = 0.0
     open_trade: bool = False
 
     @property
-    def return_pct(self) -> Optional[float]:
+    def etf_return_pct(self) -> Optional[float]:
+        """Raw ETF gain/loss — NOT the portfolio impact."""
         if self.exit_price is None:
             return None
         return (self.exit_price / self.entry_price - 1) * 100
+
+    @property
+    def portfolio_return_pct(self) -> Optional[float]:
+        """ETF return × allocation = actual impact on strategy capital."""
+        if self.etf_return_pct is None:
+            return None
+        return self.etf_return_pct * self.entry_allocation
 
     @property
     def hold_weeks(self) -> Optional[int]:
@@ -147,16 +156,31 @@ def load_data(ticker: str, start: str, no_cache: bool) -> pd.DataFrame:
 
 # ── Simulation ────────────────────────────────────────────────────────────────
 
-def simulate(df: pd.DataFrame) -> list[Trade]:
+_CASH_RATE_WEEKLY = 0.04 / 52   # 4% annual risk-free rate on idle cash
+
+
+def simulate(df: pd.DataFrame) -> tuple[list[Trade], pd.Series]:
+    """
+    Returns (trades, equity_series).
+    equity_series tracks portfolio value week-by-week starting at 1.0,
+    crediting the index return on the deployed fraction and risk-free rate
+    on idle cash.  This is the basis for CAGR and max-drawdown reporting.
+    """
     idx_col = df.attrs["idx_col"]
     trades: list[Trade] = []
 
-    # State
+    # Trade state
     allocation: float          = 0.0
     avg_entry: Optional[float] = None
     entry_date: Optional[date] = None
     entry_tier: str            = "NO_SIGNAL"
     max_dd_current: float      = 0.0
+
+    # Portfolio equity curve
+    equity: float = 1.0
+    prev_price: Optional[float] = None
+    equity_index: list = []
+    equity_values: list = []
 
     for ts, row in df.iterrows():
         week_date = ts.date()
@@ -209,7 +233,7 @@ def simulate(df: pd.DataFrame) -> list[Trade]:
         tier   = panic.signal_tier()
         target = _TIER_TARGETS[tier] * filt.effective_cap()
 
-        # ── Entry: tier upgrade ───────────────────────────────────────────────
+        # ── Entry: target increased (tier upgrade or filter relaxation) ─────
         if target > allocation:
             add = target - allocation
             if allocation == 0:
@@ -222,7 +246,7 @@ def simulate(df: pd.DataFrame) -> list[Trade]:
                 entry_tier = tier
             allocation = target
 
-        # ── Track max drawdown during hold ────────────────────────────────────
+        # ── Track max drawdown while in trade ────────────────────────────────
         if allocation > 0 and avg_entry and price < avg_entry:
             dd = (avg_entry - price) / avg_entry * 100
             max_dd_current = max(max_dd_current, dd)
@@ -233,6 +257,7 @@ def simulate(df: pd.DataFrame) -> list[Trade]:
                 entry_date=entry_date,
                 entry_price=avg_entry,
                 entry_tier=entry_tier,
+                entry_allocation=allocation,
                 exit_date=week_date,
                 exit_price=price,
                 max_drawdown_pct=max_dd_current,
@@ -243,6 +268,15 @@ def simulate(df: pd.DataFrame) -> list[Trade]:
             entry_tier     = "NO_SIGNAL"
             max_dd_current = 0.0
 
+        # ── Portfolio equity update (end of week) ─────────────────────────────
+        if prev_price is not None and prev_price > 0:
+            price_ret     = (price - prev_price) / prev_price
+            portfolio_ret = allocation * price_ret + (1 - allocation) * _CASH_RATE_WEEKLY
+            equity       *= (1 + portfolio_ret)
+        equity_index.append(ts)
+        equity_values.append(equity)
+        prev_price = price
+
     # Close any open position at last available price
     if allocation > 0 and avg_entry:
         last_price = df[idx_col].iloc[-1]
@@ -250,13 +284,16 @@ def simulate(df: pd.DataFrame) -> list[Trade]:
             entry_date=entry_date,
             entry_price=avg_entry,
             entry_tier=entry_tier,
+            entry_allocation=allocation,
             exit_date=df.index[-1].date(),
             exit_price=last_price,
             max_drawdown_pct=max_dd_current,
             open_trade=True,
         ))
 
-    return trades
+    equity_series = pd.Series(equity_values, index=equity_index, name="equity")
+
+    return trades, equity_series
 
 
 # ── Buy-and-hold benchmark ────────────────────────────────────────────────────
@@ -269,96 +306,104 @@ def buy_and_hold_return(df: pd.DataFrame) -> float:
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
-def report(trades: list[Trade], df: pd.DataFrame, ticker: str) -> None:
+def report(trades: list[Trade], df: pd.DataFrame, ticker: str,
+           equity_series: pd.Series) -> None:
     idx_col = df.attrs["idx_col"]
     start   = df.index[0].strftime("%Y-%m-%d")
     end     = df.index[-1].strftime("%Y-%m-%d")
     bah     = buy_and_hold_return(df)
+    years   = (df.index[-1] - df.index[0]).days / 365.25
 
-    print(f"\n{'='*68}")
+    print(f"\n{'='*74}")
     print(f"  Panic 4-Factor Backtest  —  {ticker}  ({start} → {end})")
-    print(f"{'='*68}")
-    print(f"  Note: CNN F&G approximated from VIX for all periods.")
-    print(f"  Entry: tier upgrade (cumulative staged buys).")
+    print(f"{'='*74}")
+    print(f"  Note: CNN F&G approximated from VIX.  Cash earns 4% p.a. when flat.")
+    print(f"  Entry: tier upgrade OR filter relaxation (staged buys).")
     print(f"  Exit:  VIX < 20 AND F&G_approx > 50 (market normalized).")
-    print(f"{'='*68}\n")
+    print(f"{'='*74}\n")
 
     if not trades:
         print("  No trades triggered in this period.")
         return
 
-    # Trade table header
-    print(f"  {'#':<3}  {'Entry':>10}  {'Exit':>10}  "
-          f"{'Entry $':>8}  {'Exit $':>8}  {'Return':>7}  "
-          f"{'Hold':>5}  {'MaxDD':>6}  {'Tier'}")
-    print(f"  {'-'*3}  {'-'*10}  {'-'*10}  "
-          f"{'-'*8}  {'-'*8}  {'-'*7}  "
-          f"{'-'*5}  {'-'*6}  {'-'*20}")
+    # Trade table — show ETF return AND allocation-weighted portfolio impact
+    hdr = (f"  {'#':<3}  {'Entry':>10}  {'Exit':>10}  "
+           f"{'ETF Ret':>8}  {'Alloc':>6}  {'Port Ret':>9}  "
+           f"{'Hold':>5}  {'MaxDD':>6}  Tier")
+    sep = "  " + "-" * (len(hdr) - 2)
+    print(hdr)
+    print(sep)
 
-    returns = []
     for i, t in enumerate(trades, 1):
-        ret  = t.return_pct
-        tag  = " (open)" if t.open_trade else ""
-        ret_s = f"{ret:+.1f}%" if ret is not None else "open"
-        returns.append(ret if ret is not None else 0.0)
+        tag   = " (open)" if t.open_trade else ""
+        etr   = f"{t.etf_return_pct:+.1f}%" if t.etf_return_pct is not None else "?"
+        ptr   = f"{t.portfolio_return_pct:+.1f}%" if t.portfolio_return_pct is not None else "?"
+        alloc = f"{t.entry_allocation*100:.0f}%"
         print(
             f"  {i:<3}  {str(t.entry_date):>10}  {str(t.exit_date):>10}  "
-            f"{t.entry_price:>8.2f}  {t.exit_price:>8.2f}  "
-            f"{ret_s:>7}  {str(t.hold_weeks or '?'):>5}wk  "
+            f"{etr:>8}  {alloc:>6}  {ptr:>9}  "
+            f"{str(t.hold_weeks or '?'):>5}wk  "
             f"{t.max_drawdown_pct:>5.1f}%  {t.entry_tier}{tag}"
         )
 
-    # Summary stats
-    closed = [t for t in trades if not t.open_trade]
-    wins   = [t for t in closed if t.return_pct and t.return_pct > 0]
-    rets   = [t.return_pct for t in closed if t.return_pct is not None]
+    # Per-trade stats (portfolio-level, not ETF-level)
+    closed  = [t for t in trades if not t.open_trade]
+    ptrs    = [t.portfolio_return_pct for t in closed if t.portfolio_return_pct is not None]
+    wins    = [p for p in ptrs if p > 0]
 
-    print(f"\n{'='*68}")
-    print(f"  Summary")
-    print(f"{'='*68}")
-    print(f"  Trades (closed)      : {len(closed)}")
-    if rets:
-        print(f"  Win rate             : {len(wins)}/{len(closed)}  "
-              f"({len(wins)/len(closed)*100:.0f}%)")
-        print(f"  Avg return           : {np.mean(rets):+.1f}%")
-        print(f"  Median return        : {np.median(rets):+.1f}%")
-        print(f"  Best trade           : {max(rets):+.1f}%")
-        print(f"  Worst trade          : {min(rets):+.1f}%")
+    # Portfolio-level stats from equity curve
+    total_return = (equity_series.iloc[-1] - 1) * 100
+    cagr         = (equity_series.iloc[-1] ** (1 / years) - 1) * 100
+    rolling_max  = equity_series.cummax()
+    port_max_dd  = abs(((equity_series - rolling_max) / rolling_max).min() * 100)
+
+    # Buy-and-hold CAGR for comparison
+    bah_eq   = df[idx_col].dropna()
+    bah_cagr = (bah_eq.iloc[-1] / bah_eq.iloc[0]) ** (1 / years) * 100 - 100
+
+    total_weeks    = len(df)
+    deployed_weeks = sum(t.hold_weeks or 0 for t in closed)
+    deployed_pct   = deployed_weeks / total_weeks * 100 if total_weeks else 0
+
+    print(f"\n{'='*74}")
+    print(f"  Portfolio summary  (strategy capital = 100%, cash earns 4% p.a.)")
+    print(f"{'='*74}")
+    print(f"  Trades (closed)          : {len(closed)}")
+    if ptrs:
+        print(f"  Win rate (port impact)   : {len(wins)}/{len(ptrs)}  "
+              f"({len(wins)/len(ptrs)*100:.0f}%)")
+        print(f"  Avg portfolio impact/trade: {np.mean(ptrs):+.1f}%  "
+              f"(median {np.median(ptrs):+.1f}%)")
         avg_hold = np.mean([t.hold_weeks for t in closed if t.hold_weeks])
-        print(f"  Avg hold time        : {avg_hold:.0f} weeks")
-        avg_dd = np.mean([t.max_drawdown_pct for t in closed])
-        print(f"  Avg max drawdown     : {avg_dd:.1f}%")
-
-    # Strategy vs buy-and-hold (strategy only deployed during trade periods)
-    total_weeks = len(df)
-    strategy_weeks = sum(
-        t.hold_weeks or 0 for t in closed
-    )
-    deployed_pct = strategy_weeks / total_weeks * 100 if total_weeks else 0
-    print(f"\n  Buy-and-hold return  : {bah:+.1f}%")
-    print(f"  Strategy deployed    : ~{deployed_pct:.0f}% of weeks")
-    print(f"  (Strategy capital not deployed earns risk-free rate when flat)")
+        print(f"  Avg hold time            : {avg_hold:.0f} weeks")
+    print(f"\n  Total strategy return    : {total_return:+.1f}%")
+    print(f"  Strategy CAGR            : {cagr:+.1f}% p.a.")
+    print(f"  Max portfolio drawdown   : -{port_max_dd:.1f}%")
+    print(f"  Time deployed            : ~{deployed_pct:.0f}% of weeks")
+    print(f"\n  Buy-and-hold return      : {bah:+.1f}%  (CAGR {bah_cagr:+.1f}% p.a.)")
     print(f"\n  Caveats:")
     print(f"  - Entry/exit at Friday close (no slippage modeled)")
     print(f"  - F&G approximated from VIX (lower accuracy pre-2012)")
     print(f"  - NAAIM started 2006; credit (HYG) started 2007")
-    print(f"  - Single exit rule used (live trading uses 3-tranche exits)")
-    print(f"{'='*68}\n")
+    print(f"  - Backtest uses single combined exit; live uses 3-tranche exits")
+    print(f"{'='*74}\n")
 
 
 # ── CSV export ────────────────────────────────────────────────────────────────
 
 def save_csv(trades: list[Trade], path: str) -> None:
     rows = [{
-        "entry_date":     t.entry_date,
-        "exit_date":      t.exit_date,
-        "entry_price":    t.entry_price,
-        "exit_price":     t.exit_price,
-        "return_pct":     round(t.return_pct, 2) if t.return_pct else None,
-        "hold_weeks":     t.hold_weeks,
-        "max_drawdown":   round(t.max_drawdown_pct, 2),
-        "entry_tier":     t.entry_tier,
-        "open":           t.open_trade,
+        "entry_date":        t.entry_date,
+        "exit_date":         t.exit_date,
+        "entry_price":       t.entry_price,
+        "exit_price":        t.exit_price,
+        "entry_allocation":  t.entry_allocation,
+        "etf_return_pct":    round(t.etf_return_pct, 2) if t.etf_return_pct else None,
+        "portfolio_return_pct": round(t.portfolio_return_pct, 2) if t.portfolio_return_pct else None,
+        "hold_weeks":        t.hold_weeks,
+        "max_drawdown":      round(t.max_drawdown_pct, 2),
+        "entry_tier":        t.entry_tier,
+        "open":              t.open_trade,
     } for t in trades]
     pd.DataFrame(rows).to_csv(path, index=False)
     print(f"  Trade log saved → {path}")
@@ -382,8 +427,8 @@ def main():
     args = parser.parse_args()
 
     df = load_data(args.ticker.upper(), args.start, args.no_cache)
-    trades = simulate(df)
-    report(trades, df, args.ticker.upper())
+    trades, equity_series = simulate(df)
+    report(trades, df, args.ticker.upper(), equity_series)
 
     if args.csv:
         save_csv(trades, args.csv)
