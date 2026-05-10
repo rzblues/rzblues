@@ -263,3 +263,82 @@ def _scrape_naaim_html() -> float:
     exposure_col = _find_col(df, ["NAAIM Number", "Exposure", "Mean", "Average"])
     df = df.dropna(subset=[exposure_col])
     return float(df.iloc[-1][exposure_col])
+
+
+# ── Historical full-series fetchers (for backtesting) ────────────────────────
+
+def fetch_aaii_history() -> pd.DataFrame:
+    """
+    Full AAII weekly history since 1987.
+    Returns DataFrame indexed by date with column 'spread' (Bull% - Bear%).
+    Cached for 24 hours.
+    """
+    cached = cache.load("aaii_history", ttl=86400)
+    if cached is not None:
+        df = pd.DataFrame(cached)
+        df["date"] = pd.to_datetime(df["date"])
+        return df.set_index("date").sort_index()
+
+    resp = requests.get(_AAII_URL, headers=_HEADERS, timeout=20)
+    resp.raise_for_status()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        df = pd.read_excel(
+            io.BytesIO(resp.content), engine="xlrd", skiprows=3, header=0
+        )
+
+    df.columns = [str(c).strip() for c in df.columns]
+    date_col = df.columns[0]
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df[df[date_col].notna()].copy().set_index(date_col).sort_index()
+
+    bull_col = _find_col(df, ["Bullish", "Bull"])
+    bear_col = _find_col(df, ["Bearish", "Bear"])
+
+    result = pd.DataFrame({
+        "bull": df[bull_col].astype(float),
+        "bear": df[bear_col].astype(float),
+    })
+    if result["bull"].median() < 1.1:   # stored as decimals
+        result["bull"] *= 100
+        result["bear"] *= 100
+    result["spread"] = result["bull"] - result["bear"]
+
+    records = result.reset_index().rename(columns={date_col: "date"})
+    records["date"] = records["date"].astype(str)
+    cache.save("aaii_history", records.to_dict("records"))
+    return result
+
+
+def fetch_naaim_history() -> pd.DataFrame:
+    """
+    Full NAAIM weekly history since 2006.
+    Returns DataFrame indexed by date with column 'exposure'.
+    Cached for 24 hours.
+    """
+    cached = cache.load("naaim_history", ttl=86400)
+    if cached is not None:
+        df = pd.DataFrame(cached)
+        df["date"] = pd.to_datetime(df["date"])
+        return df.set_index("date").sort_index()
+
+    content = _try_naaim_excel()
+    if content is None:
+        raise RuntimeError("Cannot download NAAIM Excel — check network or URL")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        df = pd.read_excel(io.BytesIO(content), engine="openpyxl")
+
+    date_col = df.columns[0]
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df[df[date_col].notna()].copy().set_index(date_col).sort_index()
+
+    exposure_col = _find_col(df, ["NAAIM Number", "Exposure", "Mean", "Average"])
+    result = pd.DataFrame({"exposure": df[exposure_col].astype(float)})
+
+    records = result.reset_index().rename(columns={date_col: "date"})
+    records["date"] = records["date"].astype(str)
+    cache.save("naaim_history", records.to_dict("records"))
+    return result
