@@ -3,8 +3,8 @@
 Cashflow crisis-buy backtest.
 
 This tests the real personal-investor model:
-  - new cash arrives every trading day
-  - optional base DCA buys happen every day
+  - new cash arrives daily or monthly
+  - optional base DCA buys happen when cash arrives
   - reserve cash earns a cash rate
   - panic signals deploy reserve cash into a panic asset
   - purchased leveraged panic shares can optionally be reduced into the base asset
@@ -148,6 +148,26 @@ def _stats(name: str, equity: pd.Series, contributions: float) -> dict:
     }
 
 
+def _contribution_schedule(
+    index: pd.DatetimeIndex,
+    daily_contribution: float,
+    contribution_frequency: str,
+    monthly_contribution: Optional[float],
+) -> pd.Series:
+    if contribution_frequency == "daily":
+        return pd.Series(daily_contribution, index=index)
+    if contribution_frequency != "monthly":
+        raise ValueError(f"unsupported contribution frequency: {contribution_frequency}")
+
+    schedule = pd.Series(0.0, index=index)
+    month_keys = pd.Series(index.to_period("M"), index=index)
+    for _, month_dates in month_keys.groupby(month_keys):
+        dates = month_dates.index
+        amount = monthly_contribution if monthly_contribution is not None else daily_contribution * len(dates)
+        schedule.loc[dates[0]] = float(amount)
+    return schedule
+
+
 def _parse_pct_list(raw: str) -> list[float]:
     values: list[float] = []
     for item in raw.split(","):
@@ -198,6 +218,8 @@ def simulate(
     base_asset: str,
     panic_asset: str,
     daily_contribution: float,
+    contribution_frequency: str,
+    monthly_contribution: Optional[float],
     base_dca_pct: float,
     min_panic_target: float,
     cost_bps: float,
@@ -221,21 +243,29 @@ def simulate(
     benchmark_rows: list[tuple[pd.Timestamp, float]] = []
 
     target_by_date = weekly_targets.to_dict()
+    contributions_by_date = _contribution_schedule(
+        prices.index,
+        daily_contribution,
+        contribution_frequency,
+        monthly_contribution,
+    )
 
     for ts, row in prices.iterrows():
         if any(asset not in row or pd.isna(row[asset]) for asset in [benchmark_asset, base_asset, panic_asset]):
             continue
 
         cash *= (1 + CASH_RATE_DAILY)
-        cash += daily_contribution
-        contributions += daily_contribution
+        contribution = float(contributions_by_date.loc[ts])
+        cash += contribution
+        contributions += contribution
 
         # Benchmark: daily DCA all cash into benchmark asset.
-        benchmark_net = daily_contribution * (1 - cost)
-        benchmark_shares += benchmark_net / float(row[benchmark_asset])
+        if contribution > 0:
+            benchmark_net = contribution * (1 - cost)
+            benchmark_shares += benchmark_net / float(row[benchmark_asset])
 
         # Strategy: buy base allocation daily, keep reserve for panic.
-        base_amount = daily_contribution * base_dca_pct
+        base_amount = contribution * base_dca_pct
         if base_amount > 0:
             net = base_amount * (1 - cost)
             shares[base_asset] += net / float(row[base_asset])
@@ -333,6 +363,16 @@ def main() -> None:
     parser.add_argument("--panic-asset", default="QLD")
     parser.add_argument("--signal-ticker", default="QQQ")
     parser.add_argument("--daily-contribution", type=float, default=100.0)
+    parser.add_argument(
+        "--contribution-frequency",
+        choices=["daily", "monthly"],
+        default="daily",
+    )
+    parser.add_argument(
+        "--monthly-contribution",
+        type=float,
+        help="Fixed monthly contribution. Defaults to daily contribution times trading days in that month.",
+    )
     parser.add_argument("--base-dca-pct", type=float, default=0.70)
     parser.add_argument("--base-dca-pcts", type=_parse_pct_list)
     parser.add_argument("--min-panic-target", type=float, default=0.20)
@@ -388,6 +428,7 @@ def main() -> None:
         args.deleveraging_keep_pct = 0.30
 
     results: list[tuple[float, str, SimulationResult, dict, dict]] = []
+    contribution_label = f"{args.contribution_frequency} DCA"
     for base_pct in base_pcts:
         for rule in rules:
             result = simulate(
@@ -397,6 +438,8 @@ def main() -> None:
                 base_asset=args.base_asset,
                 panic_asset=args.panic_asset,
                 daily_contribution=args.daily_contribution,
+                contribution_frequency=args.contribution_frequency,
+                monthly_contribution=args.monthly_contribution,
                 base_dca_pct=base_pct,
                 min_panic_target=args.min_panic_target,
                 cost_bps=args.cost_bps,
@@ -410,7 +453,7 @@ def main() -> None:
             idx = result.equity.index.intersection(result.benchmark.index)
             result.equity = result.equity.loc[idx]
             result.benchmark = result.benchmark.loc[idx]
-            benchmark_stats = _stats(f"daily DCA {args.benchmark_asset}", result.benchmark, result.contributions)
+            benchmark_stats = _stats(f"{contribution_label} {args.benchmark_asset}", result.benchmark, result.contributions)
             overlay_stats = _stats("crisis overlay", result.equity, result.contributions)
             results.append((base_pct, rule, result, benchmark_stats, overlay_stats))
 
@@ -418,8 +461,13 @@ def main() -> None:
     idx = first_result.equity.index.intersection(first_result.benchmark.index)
 
     print(f"Period: {idx[0].date()} -> {idx[-1].date()}")
-    print(f"Daily contribution: ${args.daily_contribution:,.2f}")
-    print(f"Benchmark: daily DCA {args.benchmark_asset}")
+    if args.contribution_frequency == "daily":
+        print(f"Daily contribution: ${args.daily_contribution:,.2f}")
+    elif args.monthly_contribution is None:
+        print(f"Monthly contribution: equivalent to ${args.daily_contribution:,.2f}/trading day")
+    else:
+        print(f"Monthly contribution: ${args.monthly_contribution:,.2f}")
+    print(f"Benchmark: {contribution_label} {args.benchmark_asset}")
     print(f"Panic rule: reserve buys {args.panic_asset} when panic target >= {args.min_panic_target*100:.0f}%")
     print(
         "Deleveraging: "
@@ -464,7 +512,7 @@ def main() -> None:
     base_pct, rule, result, benchmark_stats, overlay_stats = results[0]
     print(
         "Strategy: "
-        f"{base_pct*100:.0f}% daily DCA {args.base_asset}, "
+        f"{base_pct*100:.0f}% {contribution_label} {args.base_asset}, "
         f"reserve buys {args.panic_asset}, deleveraging={rule}"
     )
     print("")
@@ -491,7 +539,7 @@ def main() -> None:
     for sale in result.sales[-30:]:
         print(
             f"  {sale.date.date()} sell ${sale.amount:,.0f} {sale.asset} "
-            f"@ {sale.price:,.2f} {sale.reason} profit={sale.profit_pct:.1f}% "
+            f"@ {sale.price:,.2f} reason={sale.reason} profit={sale.profit_pct:.1f}% "
             f"target={sale.target*100:.0f}%"
         )
 
