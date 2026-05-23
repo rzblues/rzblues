@@ -96,6 +96,7 @@ def fetch_credit_market_data() -> dict:
             period="1y",
             auto_adjust=True,
             progress=False,
+            threads=False,
         )
     except Exception as exc:
         raise RuntimeError(f"yfinance multi-download failed: {exc}") from exc
@@ -103,10 +104,24 @@ def fetch_credit_market_data() -> dict:
     if tickers is None or tickers.empty:
         raise RuntimeError("yfinance returned empty data for HYG/LQD/TLT")
 
+    if "Close" not in tickers:
+        raise RuntimeError("yfinance response missing Close data for HYG/LQD/TLT")
+
     closes = tickers["Close"]
+    missing = [ticker for ticker in ["HYG", "LQD", "TLT"] if ticker not in closes.columns]
+    if missing:
+        raise RuntimeError(f"yfinance response missing credit tickers: {missing}")
+
     hyg = closes["HYG"].dropna()
     lqd = closes["LQD"].dropna()
     tlt = closes["TLT"].dropna()
+    empty = [
+        ticker
+        for ticker, series in [("HYG", hyg), ("LQD", lqd), ("TLT", tlt)]
+        if series.empty
+    ]
+    if empty:
+        raise RuntimeError(f"yfinance returned empty credit data for: {empty}")
 
     data = {
         "hyg_price":   float(hyg.iloc[-1]),

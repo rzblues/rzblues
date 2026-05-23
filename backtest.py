@@ -100,10 +100,22 @@ def load_data(ticker: str, start: str, no_cache: bool) -> pd.DataFrame:
         start=start,
         auto_adjust=True,
         progress=False,
+        threads=False,
     )
+    if raw is None or raw.empty or "Close" not in raw:
+        raise RuntimeError("yfinance returned no usable market data")
+
     closes = raw["Close"].copy()
     closes.columns = [c.lower().replace("^", "") for c in closes.columns]
     idx_col = ticker.lower().replace("^", "")
+
+    required_cols = [idx_col, "vix", "hyg", "lqd", "tlt"]
+    missing_cols = [c for c in required_cols if c not in closes.columns]
+    if missing_cols:
+        raise RuntimeError(f"yfinance response missing required columns: {missing_cols}")
+    empty_cols = [c for c in required_cols if closes[c].dropna().empty]
+    if empty_cols:
+        raise RuntimeError(f"yfinance returned empty data for required columns: {empty_cols}")
     print("done")
 
     # 200-day MA and 52-week high computed from daily data
@@ -150,6 +162,8 @@ def load_data(ticker: str, start: str, no_cache: bool) -> pd.DataFrame:
         weekly["naaim"] = 50.0
 
     weekly = weekly.dropna(subset=[idx_col, "vix", "hyg", "lqd"])
+    if weekly.empty:
+        raise RuntimeError("No usable weekly rows after merging market/sentiment data")
     weekly.attrs["idx_col"] = idx_col
     return weekly
 
@@ -157,9 +171,10 @@ def load_data(ticker: str, start: str, no_cache: bool) -> pd.DataFrame:
 # ── Simulation ────────────────────────────────────────────────────────────────
 
 _CASH_RATE_WEEKLY = 0.04 / 52   # 4% annual risk-free rate on idle cash
+_DEFAULT_COST_BPS = 5.0          # one-way execution + spread cost per traded dollar
 
 
-def simulate(df: pd.DataFrame) -> tuple[list[Trade], pd.Series]:
+def simulate(df: pd.DataFrame, cost_bps: float = _DEFAULT_COST_BPS) -> tuple[list[Trade], pd.Series]:
     """
     Returns (trades, equity_series).
     equity_series tracks portfolio value week-by-week starting at 1.0,
@@ -181,6 +196,8 @@ def simulate(df: pd.DataFrame) -> tuple[list[Trade], pd.Series]:
     prev_price: Optional[float] = None
     equity_index: list = []
     equity_values: list = []
+
+    cost_rate = max(0.0, cost_bps) / 10_000
 
     for ts, row in df.iterrows():
         week_date = ts.date()
@@ -210,7 +227,16 @@ def simulate(df: pd.DataFrame) -> tuple[list[Trade], pd.Series]:
         if np.isnan(tlt_vol): tlt_vol = 0.0
         if np.isnan(high52w): high52w = price
 
-        # ── Score ────────────────────────────────────────────────────────────
+        # ── Portfolio equity update (previous close -> this close) ───────────
+        # Signals are computed at this close, so they cannot earn this week's
+        # return. The allocation entering this block is the position held during
+        # the week that just ended.
+        if prev_price is not None and prev_price > 0:
+            price_ret     = (price - prev_price) / prev_price
+            portfolio_ret = allocation * price_ret + (1 - allocation) * _CASH_RATE_WEEKLY
+            equity       *= (1 + portfolio_ret)
+
+        # ── Score at current close ───────────────────────────────────────────
         panic = compute_panic_score(
             vix=vix, fear_greed=fg,
             aaii_bull_bear_spread=aaii, naaim_exposure=naaim,
@@ -236,6 +262,8 @@ def simulate(df: pd.DataFrame) -> tuple[list[Trade], pd.Series]:
         # ── Entry: target increased (tier upgrade or filter relaxation) ─────
         if target > allocation:
             add = target - allocation
+            if cost_rate:
+                equity *= (1 - add * cost_rate)
             if allocation == 0:
                 avg_entry    = price
                 entry_date   = week_date
@@ -262,17 +290,14 @@ def simulate(df: pd.DataFrame) -> tuple[list[Trade], pd.Series]:
                 exit_price=price,
                 max_drawdown_pct=max_dd_current,
             ))
+            if cost_rate:
+                equity *= (1 - allocation * cost_rate)
             allocation     = 0.0
             avg_entry      = None
             entry_date     = None
             entry_tier     = "NO_SIGNAL"
             max_dd_current = 0.0
 
-        # ── Portfolio equity update (end of week) ─────────────────────────────
-        if prev_price is not None and prev_price > 0:
-            price_ret     = (price - prev_price) / prev_price
-            portfolio_ret = allocation * price_ret + (1 - allocation) * _CASH_RATE_WEEKLY
-            equity       *= (1 + portfolio_ret)
         equity_index.append(ts)
         equity_values.append(equity)
         prev_price = price
@@ -307,7 +332,7 @@ def buy_and_hold_return(df: pd.DataFrame) -> float:
 # ── Report ────────────────────────────────────────────────────────────────────
 
 def report(trades: list[Trade], df: pd.DataFrame, ticker: str,
-           equity_series: pd.Series) -> None:
+           equity_series: pd.Series, cost_bps: float = _DEFAULT_COST_BPS) -> None:
     idx_col = df.attrs["idx_col"]
     start   = df.index[0].strftime("%Y-%m-%d")
     end     = df.index[-1].strftime("%Y-%m-%d")
@@ -318,6 +343,7 @@ def report(trades: list[Trade], df: pd.DataFrame, ticker: str,
     print(f"  Panic 4-Factor Backtest  —  {ticker}  ({start} → {end})")
     print(f"{'='*74}")
     print(f"  Note: CNN F&G approximated from VIX.  Cash earns 4% p.a. when flat.")
+    print(f"  Execution cost: {cost_bps:.1f} bps per traded dollar.")
     print(f"  Entry: tier upgrade OR filter relaxation (staged buys).")
     print(f"  Exit:  VIX < 20 AND F&G_approx > 50 (market normalized).")
     print(f"{'='*74}\n")
@@ -366,7 +392,7 @@ def report(trades: list[Trade], df: pd.DataFrame, ticker: str,
     deployed_pct   = deployed_weeks / total_weeks * 100 if total_weeks else 0
 
     print(f"\n{'='*74}")
-    print(f"  Portfolio summary  (strategy capital = 100%, cash earns 4% p.a.)")
+    print(f"  Portfolio summary  (strategy capital = 100%, cash earns 4% p.a., costs included)")
     print(f"{'='*74}")
     print(f"  Trades (closed)          : {len(closed)}")
     if ptrs:
@@ -382,7 +408,8 @@ def report(trades: list[Trade], df: pd.DataFrame, ticker: str,
     print(f"  Time deployed            : ~{deployed_pct:.0f}% of weeks")
     print(f"\n  Buy-and-hold return      : {bah:+.1f}%  (CAGR {bah_cagr:+.1f}% p.a.)")
     print(f"\n  Caveats:")
-    print(f"  - Entry/exit at Friday close (no slippage modeled)")
+    print(f"  - Entry/exit at Friday close; intraday timing is not modeled")
+    print(f"  - Execution costs modeled as flat bps; live fills can be worse in panics")
     print(f"  - F&G approximated from VIX (lower accuracy pre-2012)")
     print(f"  - NAAIM started 2006; credit (HYG) started 2007")
     print(f"  - Backtest uses single combined exit; live uses 3-tranche exits")
@@ -422,13 +449,15 @@ def main():
                         help="Backtest start date (YYYY-MM-DD)")
     parser.add_argument("--csv",      default=None,
                         help="Save trade log to CSV file")
+    parser.add_argument("--cost-bps", type=float, default=_DEFAULT_COST_BPS,
+                        help="One-way execution cost in basis points per traded dollar")
     parser.add_argument("--no-cache", action="store_true",
                         help="Force re-download all data")
     args = parser.parse_args()
 
     df = load_data(args.ticker.upper(), args.start, args.no_cache)
-    trades, equity_series = simulate(df)
-    report(trades, df, args.ticker.upper(), equity_series)
+    trades, equity_series = simulate(df, cost_bps=args.cost_bps)
+    report(trades, df, args.ticker.upper(), equity_series, cost_bps=args.cost_bps)
 
     if args.csv:
         save_csv(trades, args.csv)
